@@ -1,3 +1,5 @@
+.. _source_documentation:
+
 ====================
 Source Documentation
 ====================
@@ -7,7 +9,7 @@ Source Documentation
     missing labels in Sphinx 1.1.x
 
 
-.. _enthought.traits.has_traits.py:
+.. _traits.has_traits.py:
 
 .. _zope.interface.declarations.py:
 
@@ -15,23 +17,16 @@ Source Documentation
 
 .. _zope.interface.py:
 
-.. _openmdao.main.datatypes.int.py:
+.. _openmdao.lib.doegenerators.api:
 
-.. _openmdao.main.datatypes.slot.py:
+.. _doedriver.py:
 
-.. _openmdao.main.datatypes.array.py:
+.. _fullfactorial.py:
 
-.. _openmdao.main.datatypes.enum.py:
-
-.. _openmdao.main.datatypes.file.py:
-
-.. _openmdao.main.datatypes.float.py:
-
+.. _openmdao.lib.casehandler.api.py:
 
 .. toctree::
-   :maxdepth: 3 
+   :maxdepth: 3
    :glob:
-   
+
    packages/*
-
-

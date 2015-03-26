@@ -8,24 +8,25 @@ import pkg_resources
 import shutil
 import sys
 import time
+import tempfile
 import unittest
 import nose
 
 from multiprocessing.managers import RemoteError
 
-from openmdao.main.api import Assembly, FileRef, FileMetadata, SimulationRoot, \
-                              set_as_top
+from openmdao.main.api import Assembly, FileMetadata, SimulationRoot, set_as_top
 from openmdao.main.eggchecker import check_save_load
 from openmdao.main.exceptions import RunInterrupted
 from openmdao.main.objserverfactory import ObjServerFactory
 from openmdao.main.rbac import Credentials, get_credentials
 
 from openmdao.lib.components.external_code import ExternalCode
-from openmdao.lib.datatypes.api import Int, File, Str
+from openmdao.main.datatypes.api import Int, File, FileRef, Str
 
 from openmdao.test.cluster import init_cluster
 
 from openmdao.util.testutil import assert_raises
+from openmdao.util.fileutil import onerror
 
 
 # Capture original working directory so we can restore in tearDown().
@@ -33,6 +34,7 @@ ORIG_DIR = os.getcwd()
 
 # Directory where we can find sleep.py.
 DIRECTORY = pkg_resources.resource_filename('openmdao.lib.components', 'test')
+TMPDIR = os.getcwd()  # we'll set this for each test
 
 ENV_FILE = 'env-data'
 INP_FILE = 'input-data'
@@ -45,12 +47,14 @@ class Sleeper(ExternalCode):
     delay = Int(1, units='s', iotype='in')
     env_filename = Str(iotype='in')
     infile = File(iotype='in', local_path='input')
-    outfile = File(iotype='out', path='output')
+    outfile = File(FileRef('output'), iotype='out')
 
     def __init__(self):
-        super(Sleeper, self).__init__(directory=DIRECTORY)
+        super(Sleeper, self).__init__()
+        self.directory = TMPDIR
         self.external_files = [
-            FileMetadata(path='sleep.py', input=True, constant=True),
+            FileMetadata(path='sleep.py', 
+                         input=True, constant=True),
         ]
 
     def execute(self):
@@ -73,10 +77,9 @@ class Model(Assembly):
     """ Run multiple `Unique` component instances. """
 
     infile = File(iotype='in', local_path='input')
-    outfile = File(iotype='out', path='output')
+    outfile = File(FileRef('output'), iotype='out')
 
-    def __init__(self):
-        super(Model, self).__init__()
+    def configure(self):
         self.add('a', Unique())
         self.add('b', Unique())
         self.driver.workflow.add(['a', 'b'])
@@ -89,30 +92,27 @@ class TestCase(unittest.TestCase):
     """ Test the ExternalCode component. """
 
     def setUp(self):
-        SimulationRoot.chroot(DIRECTORY)
+        global TMPDIR
+        self.startdir = os.getcwd()
+        self.tempdir = tempfile.mkdtemp(prefix='test_extcode-')
+        TMPDIR = self.tempdir
+        os.chdir(self.tempdir)
+        SimulationRoot.chroot(self.tempdir)
+        shutil.copy(os.path.join(DIRECTORY, 'sleep.py'), 
+                    os.path.join(self.tempdir, 'sleep.py'))
         with open(INP_FILE, 'w') as out:
             out.write(INP_DATA)
-        if os.path.exists(ENV_FILE):
-            os.remove(ENV_FILE)
-        
+        dum = Assembly()  # create this here to prevent any Assemblies in tests to be 'first'
+
     def tearDown(self):
-        for directory in ('a', 'b'):
-            if os.path.exists(directory):
-                shutil.rmtree(directory)
-        for name in (ENV_FILE, INP_FILE, 'input', 'output'):
-            if os.path.exists(name):
-                os.remove(name)
-        if os.path.exists("error.out"):
+        SimulationRoot.chroot(self.startdir)
+        os.chdir(self.startdir)
+        if not os.environ.get('OPENMDAO_KEEPDIRS', False):
             try:
-                os.remove("error.out")
-                
-            # Windows processes greedily clutch files. I see no
-            # way to delete this file in test_timeout
-            except WindowsError:
+                shutil.rmtree(self.tempdir)
+            except OSError:
                 pass
-                
-        SimulationRoot.chroot(ORIG_DIR)
-        
+
     def test_normal(self):
         logging.debug('')
         logging.debug('test_normal')
@@ -123,6 +123,7 @@ class TestCase(unittest.TestCase):
         sleeper.external_files.append(
             FileMetadata(path=ENV_FILE, output=True))
         sleeper.infile = FileRef(INP_FILE, sleeper, input=True)
+        sleeper.stderr = None
 
         sleeper.run()
 
@@ -138,12 +139,56 @@ class TestCase(unittest.TestCase):
             result = inp.read()
         self.assertEqual(result, INP_DATA)
 
-        # Now show that existing outputs are removed before execution.
-        sleeper.env_filename = ''
+        # Force an error.
+        sleeper.stderr = 'sleep.err'
+        sleeper.delay = -1
+        assert_raises(self, 'sleeper.run()', globals(), locals(), RuntimeError,
+                      ': return_code = 1')
+        sleeper.delay = 1
+
+        # Redirect stdout & stderr.
+        sleeper.env_vars = {'SLEEP_ECHO': '1'}
+        sleeper.stdin  = 'sleep.in'
+        sleeper.stdout = 'sleep.out'
+        sleeper.stderr = 'sleep.err'
+        with open('sleep.in', 'w') as out:
+            out.write('Hello World!\n')
         sleeper.run()
-        msg = "[Errno 2] No such file or directory: '%s'" % ENV_FILE
-        assert_raises(self, "open('%s', 'rU')" % ENV_FILE,
-                      globals(), locals(), IOError, msg)
+        with open('sleep.out', 'r') as inp:
+            self.assertEqual(inp.read(), 'stdin echo to stdout\n'
+                                         'Hello World!\n')
+        with open('sleep.err', 'r') as inp:
+            self.assertEqual(inp.read(), 'stdin echo to stderr\n'
+                                         'Hello World!\n')
+
+        # Exercise check_files() errors.
+        os.remove('input')
+        assert_raises(self, 'sleeper.check_files(inputs=True)',
+                      globals(), locals(), RuntimeError,
+                      ": missing 'in' file 'input'")
+        os.remove('output')
+        assert_raises(self, 'sleeper.check_files(inputs=False)',
+                      globals(), locals(), RuntimeError,
+                      ": missing 'out' file 'output'")
+        os.remove('sleep.in')
+        assert_raises(self, 'sleeper.check_files(inputs=True)',
+                      globals(), locals(), RuntimeError,
+                      ": missing stdin file 'sleep.in'")
+        os.remove('sleep.err')
+        assert_raises(self, 'sleeper.check_files(inputs=False)',
+                      globals(), locals(), RuntimeError,
+                      ": missing stderr file 'sleep.err'")
+        os.remove('sleep.out')
+        assert_raises(self, 'sleeper.check_files(inputs=False)',
+                      globals(), locals(), RuntimeError,
+                      ": missing stdout file 'sleep.out'")
+
+        # Show that non-existent expected files are detected.
+        sleeper.external_files.append(
+            FileMetadata(path='missing-input', input=True))
+        assert_raises(self, 'sleeper.run()',
+                      globals(), locals(), RuntimeError,
+                      ": missing input file 'missing-input'")
 
     def test_remote(self):
         logging.debug('')
@@ -156,7 +201,8 @@ class TestCase(unittest.TestCase):
         sleeper.external_files.append(
             FileMetadata(path=ENV_FILE, output=True))
         sleeper.infile = FileRef(INP_FILE, sleeper, input=True)
-        sleeper.resources = {'n_cpus': 1}
+        sleeper.timeout = 5
+        sleeper.resources = {'min_cpus': 1}
 
         sleeper.run()
 
@@ -172,20 +218,35 @@ class TestCase(unittest.TestCase):
             result = inp.read()
         self.assertEqual(result, INP_DATA)
 
+        # Null input file.
+        sleeper.stdin = ''
+        assert_raises(self, 'sleeper.run()', globals(), locals(), ValueError,
+                      ": Remote execution requires stdin of DEV_NULL or"
+                      " filename, got ''")
+
+        # Specified stdin, stdout, and join stderr.
+        with open('sleep.in', 'w') as out:
+            out.write('froboz is a pig!\n')
+        sleeper.stdin = 'sleep.in'
+        sleeper.stdout = 'sleep.out'
+        sleeper.stderr = ExternalCode.STDOUT
+        sleeper.run()
+
+        # Null stderr.
+        sleeper.stderr = None
+        sleeper.run()
+
     def test_bad_alloc(self):
         logging.debug('')
         logging.debug('test_bad_alloc')
 
         extcode = set_as_top(ExternalCode())
         extcode.command = ['python', 'sleep.py']
-        extcode.resources = {'no_such_resource': 1}
+        extcode.resources = {'allocator': 'LocalHost',
+                             'localhost': False}
 
-        try:
-            extcode.run()
-        except RuntimeError as exc:
-            self.assertEqual(str(exc), ': Server allocation failed :-(')
-        else:
-            self.fail('Exected RuntimeError')
+        assert_raises(self, 'extcode.run()', globals(), locals(),
+                      RuntimeError, ': Server allocation failed')
 
     def test_copy(self):
         logging.debug('')
@@ -203,7 +264,7 @@ class TestCase(unittest.TestCase):
             extcode.copy_inputs('Inputs', '*.inp')
             self.assertEqual(os.path.exists('junk.inp'), True)
         finally:
-            shutil.rmtree('Inputs')
+            shutil.rmtree('Inputs', onerror=onerror)
             if os.path.exists('junk.inp'):
                 os.remove('junk.inp')
 
@@ -217,7 +278,7 @@ class TestCase(unittest.TestCase):
             extcode.copy_results('Outputs', '*.dat')
             self.assertEqual(os.path.exists('junk.dat'), True)
         finally:
-            shutil.rmtree('Outputs')
+            shutil.rmtree('Outputs', onerror=onerror)
             if os.path.exists('junk.dat'):
                 os.remove('junk.dat')
 
@@ -228,8 +289,6 @@ class TestCase(unittest.TestCase):
         sleeper = set_as_top(Sleeper())
         sleeper.name = 'Sleepy'
         sleeper.infile = FileRef(INP_FILE, sleeper, input=True)
-        import glob
-        logging.critical('%s', glob.glob('*'))
 
         # Exercise check_save_load().
         retcode = check_save_load(sleeper)
@@ -257,14 +316,12 @@ class TestCase(unittest.TestCase):
 
         # Set command to nonexistant path.
         extcode = set_as_top(ExternalCode())
-        extcode.command = ['xyzzy']
+        extcode.command = ['no-such-command']
+
         try:
             extcode.run()
-        except OSError as exc:
-            if sys.platform == 'win32':
-                msg = '[Error 2] The system cannot find the file specified'
-            else:
-                msg = '[Errno 2] No such file or directory'
+        except ValueError as exc:
+            msg = ": The command to be executed, 'no-such-command', cannot be found"
             self.assertEqual(str(exc), msg)
             self.assertEqual(extcode.return_code, -999999)
         else:
@@ -281,24 +338,18 @@ class TestCase(unittest.TestCase):
         try:
             extcode.run()
         except ValueError as exc:
-            self.assertEqual(str(exc), ': Null command line')
+            self.assertEqual(str(exc), ': Empty command list')
         else:
             self.fail('Expected ValueError')
         finally:
             if os.path.exists(extcode.stdout):
                 os.remove(extcode.stdout)
-    
+
     def test_unique(self):
         logging.debug('')
         logging.debug('test_unique')
 
-        model = Model()
-        for comp in (model.a, model.b):
-            self.assertEqual(comp.create_instance_dir, True)
-        self.assertNotEqual(model.a.directory, 'a')
-        self.assertNotEqual(model.b.directory, 'b')
-
-        set_as_top(model)
+        model = set_as_top(Model())
         for comp in (model.a, model.b):
             self.assertEqual(comp.create_instance_dir, False)
             self.assertEqual(comp.return_code, 0)
@@ -322,7 +373,7 @@ class TestCase(unittest.TestCase):
 
         testdir = 'external_rsh'
         if os.path.exists(testdir):
-            shutil.rmtree(testdir)
+            shutil.rmtree(testdir, onerror=onerror)
         os.mkdir(testdir)
         os.chdir(testdir)
 
@@ -342,19 +393,15 @@ class TestCase(unittest.TestCase):
             else:
                 self.fail('Expected RemoteError')
 
-            exec_comp.set('command', ['this-should-pass'])
-
-            # Try to set via remote-looking access.
-            creds = get_credentials()
-            creds.client_creds = Credentials()
-            logging.debug('    using %s', creds)
+            # Try to set via set() on remote instance.
             try:
-                code = "exec_comp.set('command', ['this-should-fail'])"
-                assert_raises(self, code, globals(), locals(), RuntimeError,
-                              ": 'command' may not be set() remotely")
-            finally:
-                creds.client_creds = None
-
+                exec_comp.set('command', ['this-should-fail'])
+            except RemoteError as exc:
+                fragment = ": 'command' may not be set() remotely"
+                if fragment not in str(exc):
+                    self.fail('%s not in %s' % (fragment, exc))
+            else:
+                self.fail('Expected RemoteError')
         finally:
             if factory is not None:
                 factory.cleanup()
@@ -363,11 +410,10 @@ class TestCase(unittest.TestCase):
                 time.sleep(2)  # Wait for process shutdown.
             keep_dirs = int(os.environ.get('OPENMDAO_KEEPDIRS', '0'))
             if not keep_dirs:
-                shutil.rmtree(testdir)
+                shutil.rmtree(testdir, onerror=onerror)
 
 
 if __name__ == '__main__':
     sys.argv.append('--cover-package=openmdao.components')
     sys.argv.append('--cover-erase')
     nose.runmodule()
-
