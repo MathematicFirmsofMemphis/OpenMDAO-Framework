@@ -148,7 +148,7 @@ class System(object):
             return self.local_subsystems()
         return self.all_subsystems()
 
-    def local_subsystems(self):
+    def local_subsystems(self, recurse=False):
         return ()
 
     def all_subsystems(self):
@@ -464,6 +464,7 @@ class System(object):
 
         if not self.is_active():
             self.local_var_sizes = numpy.zeros((0,0), int)
+            self.noflat_var_sizes = numpy.zeros((0,0), int)
             self.input_sizes = numpy.zeros(0, int)
             return
 
@@ -478,10 +479,13 @@ class System(object):
         # create an (nproc x numvars) var size vector containing
         # local sizes across all processes in our comm
         self.local_var_sizes = numpy.zeros((size, len(self.vector_vars)), int)
+        self.noflat_var_sizes = numpy.zeros((size, len(self.noflat_vars)), int)
 
         ours = numpy.zeros((1, len(self.vector_vars)), int)
         for i, (name, var) in enumerate(self.vector_vars.items()):
             ours[0, i] = var['size']
+        for i, (name, var) in enumerate(self.noflat_vars.items()):
+            self.noflat_var_sizes[rank, i] = 1
 
         # collect local var sizes from all of the processes in our comm
         # these sizes will be the same in all processes except in cases
@@ -490,6 +494,8 @@ class System(object):
         # only have a slice of each of the component's variables.
         if MPI:
             comm.Allgather(ours[0,:], self.local_var_sizes)
+            comm.Allgather(self.noflat_var_sizes[rank,:],
+                           self.noflat_var_sizes)
 
         self.local_var_sizes[rank, :] = ours[0, :]
 
@@ -683,7 +689,7 @@ class System(object):
             self._comp._system.dump(nest, stream)
         else:
             if self.scatter_full:
-                self.scatter_full.dump(self, self.vec['u'], self.vec['p'], nest)
+                self.scatter_full.dump(self, self.vec['u'], self.vec['p'], nest, stream)
             partial_subs = [s for s in self.local_subsystems() if s.scatter_partial]
             for sub in self.local_subsystems():
                 if sub in partial_subs:
@@ -1561,11 +1567,17 @@ class CompoundSystem(System):
         self._ordering = ()
         self._grouped_nodes = subg.nodes()
 
-    def local_subsystems(self):
+    def local_subsystems(self, recurse=False):
         if MPI:
-            return self._local_subsystems
+            it = self._local_subsystems
         else:
-            return self.all_subsystems()
+            it = self.all_subsystems()
+
+        for sub in it:
+            yield sub
+            if recurse:
+                for s in sub.local_subsystems(recurse=True):
+                    yield s
 
     def all_subsystems(self):
         return self._local_subsystems + [data['system'] for node, data in
@@ -1791,25 +1803,24 @@ class CompoundSystem(System):
         self.dfd_solver.calculate(arg, result)
 
     def is_variable_local(self, name):
-        """Returns True if the variable in name is local to this process,
-        otherwise it returns False. If name can't be found, then an exception
-        is raised."""
+        """Returns True if the variable in name is local to this process and
+        our rank is the lowest rank that it appears on. Otherwise it returns
+        False. If name can't be found, then an exception is raised.
+        """
+        scope = self.scope
+        try:
+            if MPI is None:
+                scope.get(name) # make sure var exists
+                return True
+            elif self.is_active():
+                while scope.parent:
+                    scope = scope.parent
+                return self.mpi.rank in scope.print_ranks[name]
+        except:
+            msg = 'Cannot find a system that contains varpath %s' % name
+            raise RuntimeError(msg)
 
-        # Regular paths, get the compname
-        cname = name.split('.')[0]
-
-        # If name is a Variable Tree, then it belongs to our containing
-        # assembly, which must be local.
-        if cname in self.scope.list_vars():
-            return True
-
-        system = self.scope._system.find_system(cname, recurse_subassy=False)
-
-        if system:
-            return system.is_active()
-
-        msg = 'Cannot find a system that contains varpath %s' % name
-        raise RuntimeError(msg)
+        return False
 
     def find_system(self, name, recurse_subassy=True):
         """ Return system with given name.
@@ -2056,7 +2067,7 @@ class ParallelSystem(CompoundSystem):
                 sub.setup_variables(variables, resid_state_map)
 
         if self.local_subsystems():
-            sub = self.local_subsystems()[0]
+            sub = list(self.local_subsystems())[0]
             names = sub.variables.keys()
         else:
             sub = None
@@ -2163,6 +2174,11 @@ class OpaqueSystem(SimpleSystem):
 
     def inner(self):
         return self._inner_system
+
+    def local_subsystems(self, recurse=False):
+        if recurse:
+            for sub in self._inner_system.local_subsystems(recurse):
+                yield sub
 
     def _all_comp_nodes(self, local=False):
         return self._inner_system._all_comp_nodes(local=local)
@@ -2295,8 +2311,13 @@ class DriverSystem(SimpleSystem):
         super(DriverSystem, self).__init__(scope, graph, driver.name)
         driver._system = self
 
-    def local_subsystems(self):
-        return [s for s in self.all_subsystems() if s.is_active()]
+    def local_subsystems(self, recurse=False):
+        for sub in self.all_subsystems():
+            if sub.is_active():
+                yield sub
+                if recurse:
+                    for s in sub.local_subsystems(recurse=True):
+                        yield s
 
     def all_subsystems(self):
         return (self._comp.workflow._system,)
