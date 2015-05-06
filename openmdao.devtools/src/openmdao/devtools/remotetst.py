@@ -10,7 +10,7 @@ import paramiko.util
 from openmdao.devtools.utils import push_and_run, rm_remote_tree, \
                                     make_git_archive, fabric_cleanup, \
                                     remote_mkdir, put_dir, \
-                                    retrieve_docs, retrieve_pngs
+                                    retrieve_docs
 
 from openmdao.devtools.remote_cfg import process_options, \
                                          run_host_processes, get_tmp_user_dir, \
@@ -29,6 +29,16 @@ def _remote_build_and_test(fname=None, pyversion='python', keep=False,
 
     remotedir = get_tmp_user_dir()
     remote_mkdir(remotedir)
+
+    if cfg and cfg.has_option(hostname, 'anaconda') :
+        anaconda = cfg.getboolean(hostname, 'anaconda')
+    else:
+        anaconda = False
+
+    if cfg and cfg.has_option(hostname, 'mpi') :
+        mpi = cfg.getboolean(hostname, 'mpi')
+    else:
+        mpi = False
 
     locbldtstfile = os.path.join(os.path.dirname(__file__), 'loc_bld_tst.py')
 
@@ -65,6 +75,12 @@ def _remote_build_and_test(fname=None, pyversion='python', keep=False,
     if testargs:
         remoteargs.append('--testargs="%s"' % testargs)
 
+    if anaconda:
+        remoteargs.append('--anaconda' )
+
+    if mpi:
+        remoteargs.append('--mpi')
+
     try:
         result = push_and_run(pushfiles, runner=pyversion,
                               remotedir=remotedir,
@@ -78,14 +94,6 @@ def _remote_build_and_test(fname=None, pyversion='python', keep=False,
 
         return result.return_code
     finally:
-        if build_type == 'dev':
-            print "pulling any pngs from %s" % hostname
-            try:
-                retrieve_pngs(os.path.join('~', remotedir))
-                print "png retrieval successful"
-            except Exception as exc:
-                print "png retrieval failed:", exc
-
         if not keep:
             print "removing remote directory: %s" % remotedir
             rm_remote_tree(remotedir)
